@@ -1,0 +1,101 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# Copyright (C) 2015 Cyan, Inc.
+
+import logging
+
+import monocle
+monocle.init("twisted")
+from monocle import _o, Return #NOQA
+from monocle.stack import eventloop
+from monocle.util import sleep
+from monocle.twisted_stack.utils import cb_to_df
+
+from afkak.client import KafkaClient
+from afkak.consumer import Consumer
+from afkak.common import KafkaUnavailableError
+
+log = logging.getLogger(__name__)
+
+
+class ConsumerExample(object):
+
+    def __init__(self, topic='example_topic', runtime=60):
+        self.topic = topic
+        self.runtime = runtime
+        self._client = KafkaClient("localhost:9092")
+        self._consumer_list = []  # List of consumers
+        # List of deferred returned from consumers' start() methods
+        self._consumer_d_list = []
+
+    @_o
+    def start(self):
+        partitions = []
+        try:
+            while not partitions:
+                yield self._client.load_metadata_for_topics(self.topic)
+                e = self._client.metadata_error_for_topic(self.topic)
+                if e:
+                    log.warning("Error: %r getting metadata for topic: %s",
+                                e, self.topic)
+                else:
+                    partitions = self._client.topic_partitions[self.topic]
+        except KafkaUnavailableError:
+            log.error("Unable to communicate with any Kafka brokers")
+            self.stop()
+
+        def _note_consumer_stopped(result, consumer):
+            log.info("Consumer: %r stopped with result: %r", consumer, result)
+
+        for partition in partitions:
+            c = Consumer(self._client, self.topic, partition,
+                         self.wrapped_msg_processor)
+            self._consumer_list.append(c)
+            d = c.start(0)
+            d.addBoth(_note_consumer_stopped, c)
+            self._consumer_d_list.append(d)
+
+    @_o
+    def wait_and_stop(self):
+        yield sleep(self.runtime)
+        yield self.stop()
+
+    @_o
+    def stop(self):
+        log.info("\n")
+        log.info("Time is up, stopping consumers...")
+        # Ask each of our consumers to stop. When a consumer fully stops, it
+        # fires the deferred returned from its start() method. We saved all
+        # those deferreds away (above, in start()) in self._consumer_d_list,
+        # so now we'll use a DeferredList to wait for all of them...
+        for consumer in self._consumer_list:
+            consumer.stop()
+        for d in self._consumer_d_list:
+            yield d
+
+        yield self._client.close()
+
+        log.info("All Done!")
+        eventloop.halt()
+
+    def wrapped_msg_processor(self, consumer, msglist):
+        cb = monocle.launch(self.msg_processor, consumer, msglist)
+        return cb_to_df(cb)
+
+    @_o
+    def msg_processor(self, consumer, msglist):
+        for msg in msglist:
+            log.info("proc: msg: %r", msg)
+
+
+def main():
+    log = logging.getLogger()
+    log.setLevel(logging.INFO)
+    consumer_example = ConsumerExample(runtime=10)
+    monocle.launch(consumer_example.start)
+    monocle.launch(consumer_example.wait_and_stop)
+    eventloop.run()
+
+if __name__ == "__main__":
+    main()
+
