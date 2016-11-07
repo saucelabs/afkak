@@ -1,0 +1,115 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# Copyright (C) 2015 Cyan, Inc.
+
+import logging
+import random
+import string
+
+import monocle
+monocle.init("twisted")
+from monocle import _o, Return #NOQA
+from monocle.stack import eventloop
+from monocle.util import sleep
+
+from afkak.client import KafkaClient
+from afkak.producer import Producer
+from afkak.common import KafkaUnavailableError
+from afkak.partitioner import (RoundRobinPartitioner, HashedPartitioner)
+
+log = logging.getLogger(__name__)
+
+
+def random_string(l):
+    # Random.choice can be very slow for large amounts of data, so 'cheat'
+    if l <= 50:
+        s = "".join(random.choice(string.letters) for i in xrange(l))
+    else:
+        r = random_string(50)
+        s = "".join(r for i in xrange(l / 50))
+        if l % 50:
+            s += r[0:(l % 50)]
+    assert len(s) == l
+    return s
+
+
+class ProducerExample(object):
+
+    def __init__(self, topic='example_topic', runtime=60):
+        self.topic = topic
+        self.runtime = runtime
+        self._msgnum = 0
+        self._stopping = False
+        self._client = KafkaClient("localhost:9092")
+        self._producers = []
+        self._producers.append(Producer(self._client, RoundRobinPartitioner))
+        self._producers.append(Producer(self._client, HashedPartitioner))
+
+    @_o
+    def run(self):
+        e = True
+        try:
+            # We do this to auto-create our topic, if needed
+            while e:
+                yield self._client.load_metadata_for_topics(self.topic)
+                e = self._client.metadata_error_for_topic(self.topic)
+                if e:
+                    log.info("Error: %r getting metadata for topic: %s",
+                             e, self.topic)
+        except KafkaUnavailableError:
+            log.error("Unable to communicate with any Kafka brokers")
+            self.stop()
+
+        while not self._stopping:
+            for producer in self._producers:
+                # Create some random number of random messages and send them to
+                # the current producer
+                msgs, key = self._make_messages()
+                @_o
+                def _send_messages():
+                    try:
+                        resp = yield producer.send_messages(self.topic, key=key, msgs=msgs)
+                        log.info("%r: got response: %r", self, resp)
+                    except Exception as e:
+                        log.error("%r: got response: %r", self, e)
+                monocle.launch(_send_messages)
+            yield sleep(0.5)
+    @_o
+    def wait_and_stop(self):
+        yield sleep(self.runtime)
+        yield self.stop()
+
+    @_o
+    def stop(self):
+        log.info("\n")
+        log.info("Time is up, stopping producers...")
+
+        for producer in self._producers:
+            producer.stop()
+
+        yield self._client.close()
+        eventloop.halt()
+
+    def _make_messages(self):
+        # Generate some reasonable (random) number of random messages...
+        msgs = []
+        for i in range(1, random.randint(2, 25)):
+            msgs.append("{0}: {1}".format(self._msgnum, random_string(
+                random.randint(20, 40))))
+            self._msgnum += 1
+        key = random_string(8)
+        return (msgs, key)
+
+
+def main():
+    log = logging.getLogger()
+    log.setLevel(logging.INFO)
+    producer_example = ProducerExample(runtime=10)
+    monocle.launch(producer_example.run)
+    monocle.launch(producer_example.wait_and_stop)
+
+    eventloop.run()
+    log.info("All Done!")
+
+if __name__ == "__main__":
+    main()
